@@ -1,9 +1,9 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import tempfile
 import os
 from sentence_transformers import SentenceTransformer
-import chromadb
 from groq import Groq
 
 # --- Config ---
@@ -13,14 +13,16 @@ LLM_MODEL = "llama-3.3-70b-versatile"
 st.set_page_config(page_title="Excel Chatbot", page_icon="📊")
 st.title("📊 Chat with your Excel")
 
-# Cache the embedding model so it loads once, not on every interaction
+
 @st.cache_resource
 def load_embedder():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
+
 @st.cache_resource
 def load_groq():
     return Groq(api_key=GROQ_API_KEY)
+
 
 embedder = load_embedder()
 groq_client = load_groq()
@@ -38,26 +40,27 @@ def excel_to_chunks(filepath):
     return chunks
 
 
-def build_index(chunks, collection_name):
-    db = chromadb.Client()  # in-memory, fresh per session
-    try:
-        db.delete_collection(collection_name)
-    except:
-        pass
-    collection = db.create_collection(collection_name)
-    embeddings = embedder.encode(chunks, show_progress_bar=False).tolist()
-    collection.add(
-        documents=chunks,
-        embeddings=embeddings,
-        ids=[f"chunk_{i}" for i in range(len(chunks))]
-    )
-    return collection
+def build_index(chunks):
+    """Embed chunks and return a numpy array of embeddings."""
+    embeddings = embedder.encode(chunks, show_progress_bar=False)
+    # Normalize for cosine similarity
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    return embeddings / np.where(norms == 0, 1, norms)
 
 
-def ask(question, collection, n_results=20):
-    q_emb = embedder.encode([question]).tolist()
-    results = collection.query(query_embeddings=q_emb, n_results=n_results)
-    context = "\n".join(results["documents"][0])
+def search(question, chunks, embeddings, n_results=20):
+    """Find the most relevant chunks for a question using cosine similarity."""
+    q_emb = embedder.encode([question])[0]
+    q_emb = q_emb / (np.linalg.norm(q_emb) or 1)
+    # Cosine similarity = dot product of normalized vectors
+    scores = embeddings @ q_emb
+    top_idx = np.argsort(scores)[::-1][:n_results]
+    return [chunks[i] for i in top_idx]
+
+
+def ask(question, chunks, embeddings):
+    relevant = search(question, chunks, embeddings)
+    context = "\n".join(relevant)
 
     response = groq_client.chat.completions.create(
         model=LLM_MODEL,
@@ -74,9 +77,11 @@ def ask(question, collection, n_results=20):
     return response.choices[0].message.content
 
 
-# --- Session state to remember things between user actions ---
-if "collection" not in st.session_state:
-    st.session_state.collection = None
+# --- Session state ---
+if "chunks" not in st.session_state:
+    st.session_state.chunks = None
+if "embeddings" not in st.session_state:
+    st.session_state.embeddings = None
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "filename" not in st.session_state:
@@ -86,27 +91,25 @@ if "filename" not in st.session_state:
 uploaded = st.file_uploader("Upload an Excel file (.xlsx)", type=["xlsx"])
 
 if uploaded and uploaded.name != st.session_state.filename:
-    # New file uploaded — process it
     with st.spinner(f"Indexing {uploaded.name}..."):
-        # Save to a temp file since pandas needs a path
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
             tmp.write(uploaded.read())
             tmp_path = tmp.name
         chunks = excel_to_chunks(tmp_path)
         os.unlink(tmp_path)
-        st.session_state.collection = build_index(chunks, f"col_{hash(uploaded.name)}")
+        embeddings = build_index(chunks)
+        st.session_state.chunks = chunks
+        st.session_state.embeddings = embeddings
         st.session_state.filename = uploaded.name
-        st.session_state.messages = []  # reset chat for new file
+        st.session_state.messages = []
     st.success(f"Indexed {len(chunks)} rows from {uploaded.name}. Ask away!")
 
 # --- Chat interface ---
-if st.session_state.collection is not None:
-    # Show previous messages
+if st.session_state.chunks is not None:
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Input box
     if prompt := st.chat_input("Ask a question about your data..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
@@ -114,7 +117,7 @@ if st.session_state.collection is not None:
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                answer = ask(prompt, st.session_state.collection)
+                answer = ask(prompt, st.session_state.chunks, st.session_state.embeddings)
             st.markdown(answer)
         st.session_state.messages.append({"role": "assistant", "content": answer})
 else:
