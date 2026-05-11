@@ -4,7 +4,7 @@ import chromadb
 from groq import Groq
 
 # --- Config ---
-GROQ_API_KEY = "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"
+GROQ_API_KEY = ""
 EXCEL_FILE = "test.xlsx"
 LLM_MODEL = "llama-3.3-70b-versatile"
 
