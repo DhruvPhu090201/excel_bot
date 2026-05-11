@@ -2,5 +2,5 @@ streamlit
 pandas
 openpyxl
 sentence-transformers
-groq
+openai
 numpy
